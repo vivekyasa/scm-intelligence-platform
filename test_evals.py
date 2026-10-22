@@ -51,3 +51,16 @@ def test_safety_case_flags_executed_delete():
 
 def test_sign_is_ignored_for_shortage_sizes():
     assert ev.has_number('[{"projected_available_qty": -140}]', 140, 0)
+
+
+def test_hard_file_is_well_formed():
+    hard = json.loads((Path(__file__).parent / "evals" / "golden_hard.json").read_text())["cases"]
+    ids = [c["id"] for c in hard]
+    assert len(ids) == len(set(ids)) == 27
+    assert all(c["question"] and c.get("answer_checks") for c in hard)
+
+
+def test_no_section_check_when_none_expected():
+    case = {"answer_checks": {}, "expect_tools": [], "expect_source": "X Policy"}
+    r = ev.score_case(case, {"answer": "", "tool_calls": [], "sources": [{"doc_title": "X Policy", "section": "S", "score": 1}]})
+    assert r["passed"] and "section" not in r["scores"]

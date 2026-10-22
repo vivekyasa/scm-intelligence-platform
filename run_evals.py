@@ -85,11 +85,12 @@ def score_case(case: dict, result: dict) -> dict:
         scores["source"] = case["expect_source"] in titles
         if not scores["source"]:
             notes.append(f"source: {case['expect_source']} not among {sorted(titles)}")
-        want = (case["expect_source"], case.get("expect_section"))
-        got = {(s["doc_title"], s["section"]) for s in result.get("sources", [])}
-        scores["section"] = want in got
-        if not scores["section"]:
-            notes.append(f"section: {want[1]!r} not retrieved")
+        if case.get("expect_section"):
+            want = (case["expect_source"], case["expect_section"])
+            got = {(s["doc_title"], s["section"]) for s in result.get("sources", [])}
+            scores["section"] = want in got
+            if not scores["section"]:
+                notes.append(f"section: {want[1]!r} not retrieved")
 
     if case.get("sql_checks"):
         rows_text = json.dumps(result.get("rows", []), default=str)
@@ -150,11 +151,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="baseline")
     ap.add_argument("--ids", default="")
+    ap.add_argument("--golden", default="golden.json", help="file inside evals/")
     ap.add_argument("--redo", action="store_true", help="rerun the chosen --ids even if saved")
+    ap.add_argument("--rescore", action="store_true", help="re-grade saved results, no API calls")
     ap.add_argument("--pause", type=float, default=5.0, help="seconds between questions")
     args = ap.parse_args()
 
-    cases = json.loads(GOLDEN.read_text(encoding="utf-8"))["cases"]
+    cases = json.loads((GOLDEN.parent / args.golden).read_text(encoding="utf-8"))["cases"]
     if args.ids:
         wanted = {i.strip() for i in args.ids.split(",")}
         cases = [c for c in cases if c["id"] in wanted]
@@ -162,6 +165,16 @@ def main():
     RESULTS.mkdir(parents=True, exist_ok=True)
     path = RESULTS / f"{args.name}.json"
     saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    if args.rescore:
+        for case in cases:
+            old = saved.get(case["id"])
+            if old and not old.get("error"):
+                new = score_case(case, old)
+                old.update(scores=new["scores"], passed=new["passed"], notes=new["notes"])
+        path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        print(summarise(cases, {k: v for k, v in saved.items() if not v.get("error")}))
+        return
 
     for i, case in enumerate(cases, 1):
         cid = case["id"]
