@@ -62,6 +62,7 @@ HITS = [
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
     monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
+    monkeypatch.setattr(app_module, "LIMITER", app_module.Limiter(per_ip=100, per_day=1000))
 
 
 def use(monkeypatch, script, rows=None, run_query=None, search=None):
@@ -221,4 +222,27 @@ def test_endpoint_end_to_end(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["answer"] == "Fine."
-    assert set(body) == {"answer", "model", "latency_ms", "tool_calls", "sources", "rows"}
+    assert set(body) == {"answer", "model", "latency_ms", "tool_calls", "sources", "rows",
+                         "input_tokens", "output_tokens"}
+
+
+def test_token_usage_is_counted(monkeypatch):
+    resp = make_response(text="ok")
+    resp.usage_metadata = SimpleNamespace(prompt_token_count=120, candidates_token_count=30)
+    use(monkeypatch, [resp])
+    r = app_module.answer_question("how are things?")
+    assert (r.input_tokens, r.output_tokens) == (120, 30)
+
+
+def test_rate_limit_returns_429(monkeypatch):
+    use(monkeypatch, [make_response(text="a"), make_response(text="b")])
+    monkeypatch.setattr(app_module, "LIMITER", app_module.Limiter(per_ip=1, per_day=100))
+    client = TestClient(app_module.app)
+    assert client.post("/ask", json={"question": "first question"}).status_code == 200
+    assert client.post("/ask", json={"question": "second question"}).status_code == 429
+
+
+def test_home_page_and_stats():
+    client = TestClient(app_module.app)
+    assert "Supply Chain Planning Intelligence" in client.get("/").text
+    assert "requests" in client.get("/stats").json()

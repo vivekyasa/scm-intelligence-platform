@@ -29,13 +29,15 @@ from datetime import date, timedelta
 from typing import Any
 
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from google.genai import errors, types
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
 
 from embeddings import EmbeddingError
 from gemini import get_client
+from ratelimit import Limiter
 from retrieval import search_documents
 from sql_guard import UnsafeSQL, validate_sql
 
@@ -84,6 +86,8 @@ class AskResponse(BaseModel):
     tool_calls: list[ToolCall]
     sources: list[Source]
     rows: list[dict[str, Any]]
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # ----------------------------------------------------------------- prompt
@@ -149,6 +153,8 @@ Rules:
   (Source: Shortage Escalation Policy).
 - Final answer: plain English, lead with the answer, include the key numbers,
   keep it short. Do not show the SQL unless the user asks for it.
+- Plain text only. Do not use markdown such as ** or #. Short lines starting
+  with a dash are fine for lists.
 """
 
 
@@ -308,7 +314,7 @@ def answer_question(question: str) -> AskResponse:
     )
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=question)])]
 
-    state: dict[str, Any] = {"calls": [], "rows": [], "sources": {}}
+    state: dict[str, Any] = {"calls": [], "rows": [], "sources": {}, "tin": 0, "tout": 0}
     model_used = MODELS[0]
 
     def build(answer: str) -> AskResponse:
@@ -323,10 +329,15 @@ def answer_question(question: str) -> AskResponse:
             tool_calls=state["calls"],
             sources=sources,
             rows=state["rows"][:ROWS_TO_MODEL],
+            input_tokens=state["tin"],
+            output_tokens=state["tout"],
         )
 
     for _ in range(MAX_STEPS):
         model_used, response = call_model(client, contents, config)
+        usage = getattr(response, "usage_metadata", None)
+        state["tin"] += int(getattr(usage, "prompt_token_count", 0) or 0)
+        state["tout"] += int(getattr(usage, "candidates_token_count", 0) or 0)
         function_calls = response.function_calls or []
 
         if not function_calls:
@@ -354,11 +365,70 @@ def answer_question(question: str) -> AskResponse:
 
 # ----------------------------------------------------------------- api
 
+LIMITER = Limiter(
+    per_ip=int(os.environ.get("LIMIT_PER_MINUTE", "6")),
+    per_day=int(os.environ.get("LIMIT_PER_DAY", "200")),
+)
+STATS = {"requests": 0, "errors": 0, "input_tokens": 0, "output_tokens": 0, "latencies_ms": []}
+
 app = FastAPI(
     title="SCM Planning Intelligence API",
-    version="0.3.0",
+    version="0.4.0",
     description="Ask questions about supply chain planning data and policies in plain English.",
 )
+
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SCM Planning Intelligence</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#111}
+textarea{width:100%;height:4.5rem;font:inherit;padding:.5rem;box-sizing:border-box}
+button{font:inherit;padding:.5rem 1rem;margin:.25rem .25rem .25rem 0;cursor:pointer}
+.ex button{font-size:.85rem;padding:.25rem .6rem}
+#out{margin-top:1rem;white-space:pre-wrap}.meta{color:#555;font-size:.85rem;margin-top:.5rem}
+table{border-collapse:collapse;font-size:.85rem;margin-top:.5rem}td,th{border:1px solid #ccc;padding:.2rem .5rem}
+</style></head><body>
+<h1>Supply Chain Planning Intelligence</h1>
+<p>Ask in plain English about a synthetic planning database (200 items, 5 locations) and company planning policies.
+Answers come from SQL queries and policy search, with sources shown.</p>
+<div class="ex">
+<button>Which class A items have the most SHORTAGE exceptions?</button>
+<button>How quickly must we act on a HIGH shortage for a class A item?</button>
+<button>How many class B items are there, and what MAPE target applies to class B?</button>
+<button>What are our supplier payment terms?</button>
+</div>
+<textarea id="q" placeholder="Type a question"></textarea><br>
+<button id="go">Ask</button>
+<div id="out"></div><div class="meta" id="meta"></div><div id="tbl"></div>
+<script>
+const q=document.getElementById('q'),out=document.getElementById('out'),meta=document.getElementById('meta'),tbl=document.getElementById('tbl');
+document.querySelectorAll('.ex button').forEach(b=>b.onclick=()=>{q.value=b.textContent;go()});
+document.getElementById('go').onclick=go;
+async function go(){
+  const text=q.value.trim(); if(text.length<3)return;
+  out.textContent='Thinking...';meta.textContent='';tbl.textContent='';
+  try{
+    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:text})});
+    const d=await r.json();
+    if(!r.ok){out.textContent=typeof d.detail==='string'?d.detail:'Request failed.';return}
+    out.textContent=d.answer;
+    const tools=d.tool_calls.map(t=>t.tool+(t.error?' (error)':'')).join(', ')||'none';
+    const src=d.sources.map(s=>s.doc_title+' > '+s.section).join('; ')||'none';
+    meta.textContent='Tools: '+tools+' | Sources: '+src+' | '+(d.latency_ms/1000).toFixed(1)+'s | '+(d.input_tokens+d.output_tokens)+' tokens | '+d.model;
+    if(d.rows.length){
+      const cols=Object.keys(d.rows[0]);const t=document.createElement('table');
+      const h=t.insertRow();cols.forEach(c=>{const th=document.createElement('th');th.textContent=c;h.appendChild(th)});
+      d.rows.slice(0,10).forEach(row=>{const tr=t.insertRow();cols.forEach(c=>{tr.insertCell().textContent=row[c]})});
+      tbl.appendChild(t);
+    }
+  }catch(e){out.textContent='Something went wrong. Please try again.'}
+}
+</script></body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def home():
+    return PAGE
 
 
 @app.get("/health")
@@ -366,6 +436,41 @@ def health():
     return {"status": "ok", "models": MODELS}
 
 
+@app.get("/stats")
+def stats():
+    lat = sorted(STATS["latencies_ms"])
+    return {
+        "requests": STATS["requests"],
+        "errors": STATS["errors"],
+        "input_tokens": STATS["input_tokens"],
+        "output_tokens": STATS["output_tokens"],
+        "median_latency_ms": lat[len(lat) // 2] if lat else None,
+        "p95_latency_ms": lat[int(len(lat) * 0.95) - 1] if len(lat) >= 20 else None,
+    }
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.post("/ask", response_model=AskResponse)
-def ask(request: AskRequest):
-    return answer_question(request.question)
+def ask(body: AskRequest, request: Request):
+    blocked = LIMITER.check(client_ip(request))
+    if blocked:
+        raise HTTPException(status_code=429, detail=blocked)
+    STATS["requests"] += 1
+    try:
+        result = answer_question(body.question)
+    except Exception:
+        STATS["errors"] += 1
+        raise
+    STATS["input_tokens"] += result.input_tokens
+    STATS["output_tokens"] += result.output_tokens
+    STATS["latencies_ms"] = (STATS["latencies_ms"] + [result.latency_ms])[-500:]
+    print(json.dumps({"event": "ask", "latency_ms": result.latency_ms, "model": result.model,
+                      "tools": [c.tool for c in result.tool_calls],
+                      "tokens": result.input_tokens + result.output_tokens}), flush=True)
+    return result
