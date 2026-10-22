@@ -1,0 +1,128 @@
+{
+  "D01": {
+    "scores": {
+      "answer": true,
+      "tools": true,
+      "sql": true
+    },
+    "passed": true,
+    "notes": [],
+    "answer": "The item with the highest unit cost is **SKU-1111** (Field service spare 657), with a unit cost of **$2,446.77**.",
+    "model": "gemini-flash-lite-latest",
+    "latency_ms": 3123,
+    "tool_calls": [
+      {
+        "tool": "query_planning_db",
+        "input": "SELECT item_number, description, product_family, unit_cost FROM items ORDER BY unit_cost DESC LIMIT 1",
+        "row_count": 1,
+        "error": null
+      }
+    ],
+    "sources": []
+  },
+  "P01": {
+    "scores": {
+      "answer": true,
+      "tools": true,
+      "source": true,
+      "section": true
+    },
+    "passed": true,
+    "notes": [],
+    "answer": "The safety stock cover targets by ABC class are:\n\n- **Class A items:** 2.5 weeks of cover\n- **Class B items:** 2.0 weeks of cover\n- **Class C items:** 1.5 weeks of cover\n\nThese weeks of cover are calculated against the average weekly forecast over the next 8 weeks (Source: Safety Stock Policy > Coverage targets by ABC class).",
+    "model": "gemini-flash-lite-latest",
+    "latency_ms": 3308,
+    "tool_calls": [
+      {
+        "tool": "search_documents",
+        "input": "safety stock cover target class A B C items",
+        "row_count": 4,
+        "error": null
+      }
+    ],
+    "sources": [
+      {
+        "doc_title": "Safety Stock Policy",
+        "section": "Coverage targets by ABC class",
+        "score": 0.8136
+      },
+      {
+        "doc_title": "Safety Stock Policy",
+        "section": "Review cadence",
+        "score": 0.7571
+      },
+      {
+        "doc_title": "Safety Stock Policy",
+        "section": "Purpose",
+        "score": 0.7313
+      },
+      {
+        "doc_title": "Forecast Accuracy Policy",
+        "section": "Targets by class",
+        "score": 0.714
+      }
+    ]
+  },
+  "N01": {
+    "scores": {
+      "answer": true,
+      "tools": true
+    },
+    "passed": true,
+    "notes": [],
+    "answer": "The company planning policy documents do not contain information about supplier payment terms.",
+    "model": "gemini-flash-lite-latest",
+    "latency_ms": 4928,
+    "tool_calls": [
+      {
+        "tool": "search_documents",
+        "input": "supplier payment terms",
+        "row_count": 4,
+        "error": null
+      },
+      {
+        "tool": "search_documents",
+        "input": "payment terms finance invoice accounts payable",
+        "row_count": 4,
+        "error": null
+      }
+    ],
+    "sources": [
+      {
+        "doc_title": "Ordering and Lead Time Policy",
+        "section": "Supplier reliability",
+        "score": 0.6362
+      },
+      {
+        "doc_title": "Ordering and Lead Time Policy",
+        "section": "Frozen window",
+        "score": 0.6149
+      },
+      {
+        "doc_title": "Planning Cadence Policy",
+        "section": "Quarter end",
+        "score": 0.6096
+      },
+      {
+        "doc_title": "Ordering and Lead Time Policy",
+        "section": "Lead times",
+        "score": 0.6095
+      },
+      {
+        "doc_title": "Ordering and Lead Time Policy",
+        "section": "Order release rules",
+        "score": 0.5999
+      },
+      {
+        "doc_title": "Expedite and Transfer Policy",
+        "section": "Expedite approval limits",
+        "score": 0.5828
+      },
+      {
+        "doc_title": "Excess Inventory Policy",
+        "section": "Reporting",
+        "score": 0.5815
+      }
+    ]
+  }
+}
