@@ -1,9 +1,14 @@
 """
-SCM Planning Intelligence API, week 2.
+SCM Planning Intelligence API.
 
-Ask a question in plain English. A Gemini model writes a SQL query, the query
-is checked by sql_guard and run as a read-only database user, and the model
-turns the rows into a plain answer.
+Ask a question in plain English. A Gemini model decides which tool to use:
+
+  query_planning_db  writes a SQL query, checked by sql_guard and run as a
+                     read-only database user (numbers, counts, rankings)
+  search_documents   searches the policy documents by meaning with pgvector
+                     (rules, thresholds, procedures)
+
+It can use one or both, then answers in plain English with sources.
 
 Run:
     py -m uvicorn app:app --reload
@@ -13,6 +18,7 @@ Environment variables:
     GEMINI_API_KEY   your Google AI Studio key
     DATABASE_URL_RO  connection string for the read-only planner_ro user
     GEMINI_MODELS    optional, comma separated, tried in order
+    EMBED_MODEL      optional, embedding model name
 """
 
 import json
@@ -24,11 +30,13 @@ from typing import Any
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
-from google import genai
 from google.genai import errors, types
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
 
+from embeddings import EmbeddingError
+from gemini import get_client
+from retrieval import search_documents
 from sql_guard import UnsafeSQL, validate_sql
 
 # ----------------------------------------------------------------- config
@@ -41,10 +49,13 @@ MODELS = [
     ).split(",")
     if m.strip()
 ]
-MAX_STEPS = 4            # the agent may call the database at most this many times
+MAX_STEPS = 5            # the agent may call the model at most this many times
 MAX_ROWS = 200           # hard cap on rows pulled from the database
 ROWS_TO_MODEL = 50       # rows the model gets to see
 RETRIES_PER_MODEL = 2    # for temporary 5xx errors
+
+SQL_TOOL = "query_planning_db"
+DOC_TOOL = "search_documents"
 
 
 # ----------------------------------------------------------------- models
@@ -54,9 +65,16 @@ class AskRequest(BaseModel):
 
 
 class ToolCall(BaseModel):
-    sql: str
+    tool: str
+    input: str
     row_count: int = 0
     error: str | None = None
+
+
+class Source(BaseModel):
+    doc_title: str
+    section: str
+    score: float
 
 
 class AskResponse(BaseModel):
@@ -64,6 +82,7 @@ class AskResponse(BaseModel):
     model: str
     latency_ms: int
     tool_calls: list[ToolCall]
+    sources: list[Source]
     rows: list[dict[str, Any]]
 
 
@@ -101,21 +120,33 @@ def build_system_prompt() -> str:
     today = date.today()
     this_monday = today - timedelta(days=today.weekday())
     return f"""You are a supply chain planning analyst assistant.
-You answer questions about planning data by calling the query_planning_db tool
-with one read-only SQL SELECT query at a time.
+You have two tools:
+
+1. {SQL_TOOL}: run one read-only SQL SELECT query. Use it for numbers, counts,
+   rankings, trends and anything about specific items or locations.
+2. {DOC_TOOL}: search the company planning policy documents. Use it for rules,
+   thresholds, targets, approval limits, response times and procedures.
+
+Use both when a question mixes data and policy, for example "is this item's
+shortage serious enough to escalate": first get the numbers, then find the rule,
+then compare them.
 
 Today is {today.isoformat()}. The current planning week starts {this_monday.isoformat()}.
 
 {SCHEMA}
 
 Rules:
-- Only write SELECT queries (a leading WITH is fine). No comments, no semicolons
-  except at the very end, no system tables.
-- Add LIMIT 50 unless the query returns a handful of aggregate rows.
-- Always include item_number when you mention items.
-- If the tool returns an error, fix the query and try again.
-- Never invent numbers. Every figure in your answer must come from a query result.
-- If the data cannot answer the question, say so plainly.
+- SQL: only SELECT queries (a leading WITH is fine). No comments, no semicolons
+  except at the very end, no system tables. Add LIMIT 50 unless the query
+  returns a handful of aggregate rows. Always include item_number when you
+  mention items. If the tool returns an error, fix the query and try again.
+- Documents: base policy statements only on passages the tool returns. Each
+  passage has a score from 0 to 1 for how closely it matches. If the passages
+  do not actually answer the question, say the policies do not cover it. Do not
+  fill the gap from general knowledge.
+- Never invent numbers. Every figure must come from a query result or a passage.
+- When you state a policy rule, name the document it came from, for example
+  (Source: Shortage Escalation Policy).
 - Final answer: plain English, lead with the answer, include the key numbers,
   keep it short. Do not show the SQL unless the user asks for it.
 """
@@ -124,7 +155,7 @@ Rules:
 TOOL = types.Tool(
     function_declarations=[
         types.FunctionDeclaration(
-            name="query_planning_db",
+            name=SQL_TOOL,
             description=(
                 "Run one read-only SQL SELECT query against the supply chain "
                 "planning database and return the rows."
@@ -139,7 +170,28 @@ TOOL = types.Tool(
                 },
                 required=["sql"],
             ),
-        )
+        ),
+        types.FunctionDeclaration(
+            name=DOC_TOOL,
+            description=(
+                "Search the company planning policy documents by meaning and "
+                "return the most relevant passages. Use for rules, thresholds, "
+                "targets, approval limits and procedures."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "What to look up, phrased as a short question or "
+                            "topic, for example 'safety stock target for class A'."
+                        ),
+                    )
+                },
+                required=["query"],
+            ),
+        ),
     ]
 )
 
@@ -168,18 +220,6 @@ def to_jsonable(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # ----------------------------------------------------------------- model
 
-def get_client() -> genai.Client:
-    """One attempt per call, so our own fallback below is fast."""
-    try:
-        return genai.Client(
-            http_options=types.HttpOptions(
-                retry_options=types.HttpRetryOptions(attempts=1)
-            )
-        )
-    except Exception:
-        return genai.Client()
-
-
 def call_model(client, contents, config):
     """Try each model in turn. Retry temporary overloads, skip exhausted quotas."""
     last_error = None
@@ -203,6 +243,58 @@ def call_model(client, contents, config):
     )
 
 
+# ----------------------------------------------------------------- tools
+
+def first_line(error: Exception) -> str:
+    return str(error).strip().splitlines()[0]
+
+
+def use_sql_tool(args: dict, state: dict) -> dict:
+    sql = str(args.get("sql", ""))
+    try:
+        rows = run_query(sql)
+        state["rows"] = rows
+        state["calls"].append(ToolCall(tool=SQL_TOOL, input=sql, row_count=len(rows)))
+        return {"row_count": len(rows), "rows": to_jsonable(rows[:ROWS_TO_MODEL])}
+    except UnsafeSQL as e:
+        msg = f"Rejected by safety check: {e}"
+    except psycopg2.Error as e:
+        msg = f"Database error: {first_line(e)}"
+    state["calls"].append(ToolCall(tool=SQL_TOOL, input=sql, error=msg))
+    return {"error": msg}
+
+
+def use_doc_tool(args: dict, state: dict) -> dict:
+    query = str(args.get("query", ""))
+    try:
+        hits = search_documents(query)
+    except (EmbeddingError, RuntimeError) as e:
+        msg = f"Document search failed: {e}"
+    except psycopg2.Error as e:
+        msg = f"Database error: {first_line(e)}"
+    else:
+        state["calls"].append(ToolCall(tool=DOC_TOOL, input=query, row_count=len(hits)))
+        for h in hits:
+            key = (h["doc_title"], h["section"])
+            best = state["sources"].get(key, 0.0)
+            state["sources"][key] = max(best, h["score"])
+        return {
+            "results": [
+                {
+                    "source": f"{h['doc_title']} > {h['section']}",
+                    "score": h["score"],
+                    "text": h["content"],
+                }
+                for h in hits
+            ]
+        }
+    state["calls"].append(ToolCall(tool=DOC_TOOL, input=query, error=msg))
+    return {"error": msg}
+
+
+TOOLS = {SQL_TOOL: use_sql_tool, DOC_TOOL: use_doc_tool}
+
+
 # ----------------------------------------------------------------- agent
 
 def answer_question(question: str) -> AskResponse:
@@ -216,9 +308,22 @@ def answer_question(question: str) -> AskResponse:
     )
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=question)])]
 
-    tool_calls: list[ToolCall] = []
-    last_rows: list[dict[str, Any]] = []
+    state: dict[str, Any] = {"calls": [], "rows": [], "sources": {}}
     model_used = MODELS[0]
+
+    def build(answer: str) -> AskResponse:
+        sources = [
+            Source(doc_title=t, section=s, score=score)
+            for (t, s), score in sorted(state["sources"].items(), key=lambda kv: -kv[1])
+        ]
+        return AskResponse(
+            answer=answer,
+            model=model_used,
+            latency_ms=int((time.time() - started) * 1000),
+            tool_calls=state["calls"],
+            sources=sources,
+            rows=state["rows"][:ROWS_TO_MODEL],
+        )
 
     for _ in range(MAX_STEPS):
         model_used, response = call_model(client, contents, config)
@@ -228,63 +333,31 @@ def answer_question(question: str) -> AskResponse:
             text = (response.text or "").strip()
             if not text:
                 text = "I could not produce an answer. Try rephrasing the question."
-            return AskResponse(
-                answer=text,
-                model=model_used,
-                latency_ms=int((time.time() - started) * 1000),
-                tool_calls=tool_calls,
-                rows=last_rows[:ROWS_TO_MODEL],
-            )
+            return build(text)
 
         contents.append(response.candidates[0].content)
         reply_parts = []
-
         for fc in function_calls:
-            sql = str((fc.args or {}).get("sql", ""))
-            if fc.name != "query_planning_db":
+            handler = TOOLS.get(fc.name)
+            if handler is None:
                 payload = {"error": f"Unknown tool {fc.name}"}
-                tool_calls.append(ToolCall(sql=sql, error=payload["error"]))
+                state["calls"].append(ToolCall(tool=str(fc.name), input="", error=payload["error"]))
             else:
-                try:
-                    rows = run_query(sql)
-                    last_rows = rows
-                    tool_calls.append(ToolCall(sql=sql, row_count=len(rows)))
-                    payload = {
-                        "row_count": len(rows),
-                        "rows": to_jsonable(rows[:ROWS_TO_MODEL]),
-                    }
-                except UnsafeSQL as e:
-                    payload = {"error": f"Rejected by safety check: {e}"}
-                    tool_calls.append(ToolCall(sql=sql, error=payload["error"]))
-                except psycopg2.Error as e:
-                    first_line = str(e).strip().splitlines()[0]
-                    payload = {"error": f"Database error: {first_line}"}
-                    tool_calls.append(ToolCall(sql=sql, error=payload["error"]))
-
+                payload = handler(dict(fc.args or {}), state)
             reply_parts.append(
                 types.Part.from_function_response(name=fc.name, response=payload)
             )
-
         contents.append(types.Content(role="user", parts=reply_parts))
 
-    return AskResponse(
-        answer=(
-            "I reached the step limit before finishing. "
-            "Try a more specific question."
-        ),
-        model=model_used,
-        latency_ms=int((time.time() - started) * 1000),
-        tool_calls=tool_calls,
-        rows=last_rows[:ROWS_TO_MODEL],
-    )
+    return build("I reached the step limit before finishing. Try a more specific question.")
 
 
 # ----------------------------------------------------------------- api
 
 app = FastAPI(
     title="SCM Planning Intelligence API",
-    version="0.2.0",
-    description="Ask questions about supply chain planning data in plain English.",
+    version="0.3.0",
+    description="Ask questions about supply chain planning data and policies in plain English.",
 )
 
 
